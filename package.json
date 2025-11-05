@@ -1,0 +1,109 @@
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const app = express();
+const PORT = 3000;
+const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
+
+// --- Middleware Setup ---
+// Allow cross-origin requests from the frontend (running on a different port/origin)
+app.use(cors({
+    origin: 'http://localhost:8080' // Assuming frontend runs on 8080 or live-server
+})); 
+app.use(bodyParser.json());
+
+// Ensure the downloads directory exists
+if (!fs.existsSync(DOWNLOAD_DIR)) {
+    fs.mkdirSync(DOWNLOAD_DIR);
+}
+
+// Serve static files from the 'downloads' directory (where converted files are saved)
+app.use('/downloads', express.static(DOWNLOAD_DIR));
+
+/**
+ * Endpoint for processing media download and conversion.
+ * * NOTE: This implementation relies on the 'yt-dlp' command-line utility
+ * and 'ffmpeg' being installed and accessible on the server's PATH.
+ */
+app.post('/process', async (req, res) => {
+    const { mediaUrl, format, quality } = req.body;
+
+    if (!mediaUrl || !format) {
+        return res.status(400).json({ message: 'Missing media URL or output format.' });
+    }
+
+    try {
+        // Generate a unique filename to prevent conflicts
+        const safeFilename = `${Date.now()}_video_output`;
+        const outputTemplate = path.join(DOWNLOAD_DIR, safeFilename);
+
+        let args = [mediaUrl];
+
+        if (format === 'mp3') {
+            // Options for MP3 extraction using yt-dlp/ffmpeg
+            args.push(
+                '-x', // Extract audio
+                '--audio-format', 'mp3',
+                '-o', `${outputTemplate}.%(ext)s` // Output path with extension placeholder
+            );
+        } else if (format === 'mp4') {
+            // Options for best quality MP4 video
+            args.push(
+                '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]', // Select best video/audio quality
+                '--recode-video', 'mp4', // Ensure final container is mp4
+                '-o', `${outputTemplate}.%(ext)s` // Output path with extension placeholder
+            );
+        } else {
+            return res.status(400).json({ message: 'Invalid format requested.' });
+        }
+        
+        console.log(`Starting yt-dlp with arguments: ${args.join(' ')}`);
+
+        // Execute yt-dlp command
+        const ytDlpProcess = spawn('yt-dlp', args);
+
+        ytDlpProcess.stdout.on('data', (data) => {
+            console.log(`yt-dlp stdout: ${data}`);
+        });
+
+        ytDlpProcess.stderr.on('data', (data) => {
+            console.error(`yt-dlp stderr: ${data}`);
+        });
+
+        ytDlpProcess.on('close', (code) => {
+            if (code === 0) {
+                console.log(`yt-dlp process exited successfully.`);
+                
+                // Find the actual file name created by yt-dlp (since %(ext)s is dynamic)
+                const files = fs.readdirSync(DOWNLOAD_DIR).filter(file => file.startsWith(safeFilename));
+                
+                if (files.length === 1) {
+                    const finalFilename = files[0];
+                    const downloadUrl = `http://localhost:${PORT}/downloads/${finalFilename}`;
+
+                    // Send the download URL back to the frontend
+                    res.json({ success: true, downloadUrl: downloadUrl, filename: finalFilename });
+                } else {
+                    res.status(500).json({ message: "File processing succeeded, but output file not found." });
+                }
+
+            } else {
+                console.error(`yt-dlp process exited with code ${code}`);
+                res.status(500).json({ message: `Media conversion failed (yt-dlp error code ${code}). Check server logs.` });
+            }
+        });
+
+    } catch (error) {
+        console.error('Server error during processing:', error);
+        res.status(500).json({ message: 'Internal server error.' });
+    }
+});
+
+app.listen(PORT, () => {
+    console.log(`UniGrab Backend server running at http://localhost:${PORT}`);
+    console.log(`Download directory: ${DOWNLOAD_DIR}`);
+});
